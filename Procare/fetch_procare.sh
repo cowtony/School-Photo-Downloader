@@ -1,9 +1,9 @@
 #!/bin/bash
 # 从 ProCare Connect 批量下载指定月份的照片和视频。
 #
-# 用法：
-#   bash fetch_procare.sh <YYYY-MM>                  # 下载某一个月
-#   bash fetch_procare.sh <起始 YYYY-MM> <结束 YYYY-MM>  # 下载多个月（含两端）
+# 用法（先通过环境变量提供 token）：
+#   PROCARE_TOKEN=... bash fetch_procare.sh <YYYY-MM>                  # 下载某一个月
+#   PROCARE_TOKEN=... bash fetch_procare.sh <起始 YYYY-MM> <结束 YYYY-MM>  # 下载多个月（含两端）
 #
 # 例：
 #   bash fetch_procare.sh 2024-11
@@ -15,24 +15,41 @@
 #   └── videos/   全部视频 (UUID.mp4 / .mov 等)
 #
 # 文件名保留 ProCare 原始 UUID；
-# 文件创建时间、修改时间、EXIF/QuickTime 元数据都按 API 返回的 created_at 设置。
+# 文件修改时间按 API 返回的 created_at 设置；安装可选工具后也会写入创建时间和媒体元数据。
 #
-# 重复运行安全：已存在的文件会跳过，可用作增量同步。
+# 重复运行安全：有效的已有文件会跳过，可用作增量同步。
 #
-# 依赖：curl, jq, python3, exiftool, SetFile
-# 安装：brew install jq exiftool
+# 必需：curl, jq, python3；可选：exiftool, SetFile
+# 安装可选工具：brew install exiftool
 
-set -e
+set -euo pipefail
 
 # ============================================================
-# 配置：把你浏览器抓到的 Bearer token 填这里
-# 如果脚本报 401/403，去 ProCare 网页 → F12 Network → Fetch/XHR
-# 复制 'authorization: Bearer ...' 后面那串替换 TOKEN
+# 配置
 # ============================================================
-TOKEN="online_auth_<YOUR_TOKEN>"
+TOKEN="${PROCARE_TOKEN:-}"
 ORIGIN="https://schools.procareconnect.com"
 PHOTOS_API="https://api-school.procareconnect.com/api/web/parent/photos/"
 VIDEOS_API="https://api-school.procareconnect.com/api/web/parent/videos/"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/downloads}"
+
+if [ -z "$TOKEN" ]; then
+    echo "错误：请通过 PROCARE_TOKEN 环境变量提供 Bearer token。" >&2
+    echo "请先运行：export PROCARE_TOKEN; read -s PROCARE_TOKEN" >&2
+    exit 1
+fi
+
+CURL_API_ARGS=(
+    --silent --show-error --fail-with-body --location
+    --connect-timeout 10 --max-time 120
+    --retry 3 --retry-delay 2
+)
+CURL_MEDIA_ARGS=(
+    --silent --show-error --fail --location
+    --connect-timeout 10 --max-time 600
+    --retry 3 --retry-delay 2
+)
 
 # ============================================================
 # 检查依赖
@@ -69,13 +86,19 @@ fi
 START_MONTH="$1"
 END_MONTH="${2:-$1}"
 
-# 校验格式 YYYY-MM
+# 校验月份格式和值
 for m in "$START_MONTH" "$END_MONTH"; do
-    if ! [[ "$m" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-        echo "错误：月份格式必须是 YYYY-MM，比如 2024-11，但你给的是: $m"
+    if ! [[ "$m" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] || \
+       ! python3 -c "import datetime; datetime.datetime.strptime('$m', '%Y-%m')" 2>/dev/null; then
+        echo "错误：月份必须是有效的 YYYY-MM，比如 2024-11，但你给的是: $m" >&2
         exit 1
     fi
 done
+
+if [[ "$START_MONTH" > "$END_MONTH" ]]; then
+    echo "错误：起始月份不能晚于结束月份。" >&2
+    exit 1
+fi
 
 # ============================================================
 # 工具函数
@@ -120,16 +143,30 @@ call_api() {
         api="$VIDEOS_API"
         filter_key="video"
     fi
-    local from_enc to_enc
+    local from_enc to_enc body_file status
     from_enc=$(urlenc "$from")
     to_enc=$(urlenc "$to")
-    curl -sS -X GET \
+    body_file=$(mktemp)
+
+    if ! status=$(curl "${CURL_API_ARGS[@]}" -X GET \
+        -o "$body_file" -w "%{http_code}" \
         "${api}?page=${page}&filters%5B${filter_key}%5D%5Bdatetime_from%5D=${from_enc}&filters%5B${filter_key}%5D%5Bdatetime_to%5D=${to_enc}" \
         -H "accept: application/json, text/plain, */*" \
         -H "authorization: Bearer ${TOKEN}" \
         -H "origin: ${ORIGIN}" \
         -H "referer: ${ORIGIN}/" \
-        -H "user-agent: Mozilla/5.0"
+        -H "user-agent: Mozilla/5.0"); then
+        if [ "$status" = "401" ] || [ "$status" = "403" ]; then
+            echo "错误：Bearer token 无效或已过期，请重新获取。" >&2
+        else
+            echo "错误：API 请求失败（HTTP ${status:-未知}）。" >&2
+        fi
+        rm -f "$body_file"
+        return 1
+    fi
+
+    cat "$body_file"
+    rm -f "$body_file"
 }
 
 # 把 ISO 8601 时间转成各种工具需要的格式
@@ -173,9 +210,8 @@ download_photos_one_month() {
     local resp
     resp=$(call_api photos 1 "$date_from" "$date_to")
 
-    if echo "$resp" | jq -e '.error' >/dev/null 2>&1; then
-        echo "  [Photos] API 错误："
-        echo "$resp" | jq .
+    if ! echo "$resp" | jq -e '(.error | not) and (.total | type == "number") and (.per_page | type == "number") and (.photos | type == "array")' >/dev/null 2>&1; then
+        echo "  [Photos] API 返回了无效数据。" >&2
         return 1
     fi
 
@@ -195,12 +231,25 @@ download_photos_one_month() {
     all_json=$(mktemp)
     echo "$resp" | jq -c '.photos[]' > "$all_json"
 
-    local p
+    local p page_resp actual
     for ((p=2; p<=pages; p++)); do
         echo "  [Photos] 请求 page $p ..."
-        call_api photos "$p" "$date_from" "$date_to" | jq -c '.photos[]' >> "$all_json"
+        page_resp=$(call_api photos "$p" "$date_from" "$date_to")
+        if ! echo "$page_resp" | jq -e '(.photos | type == "array")' >/dev/null 2>&1; then
+            echo "  [Photos] 第 $p 页返回了无效数据。" >&2
+            rm -f "$all_json"
+            return 1
+        fi
+        echo "$page_resp" | jq -c '.photos[]' >> "$all_json"
         sleep 0.3
     done
+
+    actual=$(wc -l < "$all_json" | tr -d ' ')
+    if [ "$actual" -ne "$total" ]; then
+        echo "  [Photos] 分页记录数不一致：API 报告 $total，实际收到 $actual。" >&2
+        rm -f "$all_json"
+        return 1
+    fi
 
     local ok=0 fail=0 already=0 skip=0
     while IFS= read -r line; do
@@ -220,18 +269,20 @@ download_photos_one_month() {
         file_name=$(echo "$main_url" | sed -E 's|.*/main/([^?]+)\?.*|\1|')
         [ -z "$file_name" ] || [ "$file_name" = "$main_url" ] && file_name="${id}.jpg"
 
-        local out_path="$out_dir/$file_name"
-        if [ -e "$out_path" ]; then
+        local out_path="$out_dir/$file_name" tmp_path="${out_dir}/${file_name}.part"
+        if [ -s "$out_path" ]; then
             already=$((already+1))
             continue
         fi
+        rm -f "$out_path" "$tmp_path"
 
-        if ! curl -sS -f -o "$out_path" "$main_url"; then
+        if ! curl "${CURL_MEDIA_ARGS[@]}" -o "$tmp_path" "$main_url" || [ ! -s "$tmp_path" ]; then
             echo "  [Photos] [fail] $file_name"
-            rm -f "$out_path"
+            rm -f "$tmp_path"
             fail=$((fail+1))
             continue
         fi
+        mv "$tmp_path" "$out_path"
 
         # 解析时间
         local OLDIFS="$IFS"
@@ -242,12 +293,12 @@ download_photos_one_month() {
         local touch_fmt="${fmt_lines[0]}" setfile_fmt="${fmt_lines[1]}" exif_local="${fmt_lines[2]}"
 
         # 写 EXIF（先），再设文件时间
-        if [ -n "$EXIFTOOL_BIN" ]; then
-            "$EXIFTOOL_BIN" -overwrite_original -q \
-                -DateTimeOriginal="$exif_local" \
-                -CreateDate="$exif_local" \
-                -ModifyDate="$exif_local" \
-                "$out_path" >/dev/null 2>&1 || true
+        if [ -n "$EXIFTOOL_BIN" ] && ! "$EXIFTOOL_BIN" -overwrite_original -q \
+            -DateTimeOriginal="$exif_local" \
+            -CreateDate="$exif_local" \
+            -ModifyDate="$exif_local" \
+            "$out_path" >/dev/null 2>&1; then
+            echo "  [Photos] 警告：无法写入元数据 $file_name" >&2
         fi
         set_fs_times "$out_path" "$touch_fmt" "$setfile_fmt"
 
@@ -256,6 +307,9 @@ download_photos_one_month() {
 
     rm -f "$all_json"
     echo "  [Photos] 完成：新下 $ok / 已存在 $already / 跳过视频 $skip / 失败 $fail"
+    if [ "$fail" -gt 0 ]; then
+        return 1
+    fi
 }
 
 # ============================================================
@@ -271,9 +325,8 @@ download_videos_one_month() {
     local resp
     resp=$(call_api videos 1 "$date_from" "$date_to")
 
-    if echo "$resp" | jq -e '.error' >/dev/null 2>&1; then
-        echo "  [Videos] API 错误："
-        echo "$resp" | jq .
+    if ! echo "$resp" | jq -e '(.error | not) and (.total | type == "number") and (.per_page | type == "number") and (.videos | type == "array")' >/dev/null 2>&1; then
+        echo "  [Videos] API 返回了无效数据。" >&2
         return 1
     fi
 
@@ -293,12 +346,25 @@ download_videos_one_month() {
     all_json=$(mktemp)
     echo "$resp" | jq -c '.videos[]' > "$all_json"
 
-    local p
+    local p page_resp actual
     for ((p=2; p<=pages; p++)); do
         echo "  [Videos] 请求 page $p ..."
-        call_api videos "$p" "$date_from" "$date_to" | jq -c '.videos[]' >> "$all_json"
+        page_resp=$(call_api videos "$p" "$date_from" "$date_to")
+        if ! echo "$page_resp" | jq -e '(.videos | type == "array")' >/dev/null 2>&1; then
+            echo "  [Videos] 第 $p 页返回了无效数据。" >&2
+            rm -f "$all_json"
+            return 1
+        fi
+        echo "$page_resp" | jq -c '.videos[]' >> "$all_json"
         sleep 0.3
     done
+
+    actual=$(wc -l < "$all_json" | tr -d ' ')
+    if [ "$actual" -ne "$total" ]; then
+        echo "  [Videos] 分页记录数不一致：API 报告 $total，实际收到 $actual。" >&2
+        rm -f "$all_json"
+        return 1
+    fi
 
     local ok=0 fail=0 already=0
     while IFS= read -r line; do
@@ -311,8 +377,8 @@ download_videos_one_month() {
 
         # 探测 Content-Type 决定扩展名
         local content_type ext
-        content_type=$(curl -sS -I "$video_url" 2>/dev/null \
-            | awk -F': ' 'tolower($1)=="content-type"{print $2}' | tr -d '\r\n')
+        content_type=$(curl "${CURL_MEDIA_ARGS[@]}" -I "$video_url" 2>/dev/null \
+            | awk -F': ' 'tolower($1)=="content-type"{print $2}' | tr -d '\r\n' || true)
         case "$content_type" in
             video/mp4)        ext="mp4" ;;
             video/quicktime)  ext="mov" ;;
@@ -322,19 +388,21 @@ download_videos_one_month() {
             *)                ext="mp4" ;;
         esac
 
-        local out_path="$out_dir/${id}.${ext}"
-        if [ -e "$out_path" ]; then
+        local out_path="$out_dir/${id}.${ext}" tmp_path="${out_dir}/${id}.${ext}.part"
+        if [ -s "$out_path" ]; then
             already=$((already+1))
             continue
         fi
+        rm -f "$out_path" "$tmp_path"
 
         echo -n "  [Videos] 下载 ${id}.${ext} ..."
-        if ! curl -sS -f -o "$out_path" "$video_url"; then
+        if ! curl "${CURL_MEDIA_ARGS[@]}" -o "$tmp_path" "$video_url" || [ ! -s "$tmp_path" ]; then
             echo " fail"
-            rm -f "$out_path"
+            rm -f "$tmp_path"
             fail=$((fail+1))
             continue
         fi
+        mv "$tmp_path" "$out_path"
         local size
         size=$(du -h "$out_path" | cut -f1)
         echo " ok ($size)"
@@ -348,15 +416,15 @@ download_videos_one_month() {
         local touch_fmt="${fmt_lines[0]}" setfile_fmt="${fmt_lines[1]}" exif_utc="${fmt_lines[3]}"
 
         # MP4 元数据按 QuickTime 标准用 UTC
-        if [ -n "$EXIFTOOL_BIN" ]; then
-            "$EXIFTOOL_BIN" -overwrite_original -q \
-                -CreateDate="$exif_utc" \
-                -ModifyDate="$exif_utc" \
-                -TrackCreateDate="$exif_utc" \
-                -TrackModifyDate="$exif_utc" \
-                -MediaCreateDate="$exif_utc" \
-                -MediaModifyDate="$exif_utc" \
-                "$out_path" >/dev/null 2>&1 || true
+        if [ -n "$EXIFTOOL_BIN" ] && ! "$EXIFTOOL_BIN" -overwrite_original -q \
+            -CreateDate="$exif_utc" \
+            -ModifyDate="$exif_utc" \
+            -TrackCreateDate="$exif_utc" \
+            -TrackModifyDate="$exif_utc" \
+            -MediaCreateDate="$exif_utc" \
+            -MediaModifyDate="$exif_utc" \
+            "$out_path" >/dev/null 2>&1; then
+            echo "  [Videos] 警告：无法写入元数据 ${id}.${ext}" >&2
         fi
         set_fs_times "$out_path" "$touch_fmt" "$setfile_fmt"
 
@@ -365,6 +433,9 @@ download_videos_one_month() {
 
     rm -f "$all_json"
     echo "  [Videos] 完成：新下 $ok / 已存在 $already / 失败 $fail"
+    if [ "$fail" -gt 0 ]; then
+        return 1
+    fi
 }
 
 # ============================================================
@@ -376,8 +447,8 @@ echo
 cur="$START_MONTH"
 while :; do
     echo "================ $cur ================"
-    download_photos_one_month "$cur" "downloads/${cur}/photos"
-    download_videos_one_month "$cur" "downloads/${cur}/videos"
+    download_photos_one_month "$cur" "$OUTPUT_DIR/${cur}/photos"
+    download_videos_one_month "$cur" "$OUTPUT_DIR/${cur}/videos"
     echo
 
     if [ "$cur" = "$END_MONTH" ]; then
